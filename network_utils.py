@@ -2,6 +2,7 @@ import subprocess
 import re
 import socket
 import platform
+import shlex
 from typing import Dict, List, Any
 import time
 
@@ -14,6 +15,15 @@ class NetworkDiagnostics:
     def validate_target(self, target: str) -> bool:
         """Validate if the target is a valid IP address or hostname"""
         try:
+            # Sanitize input - only allow alphanumeric, dots, hyphens, and underscores
+            if not re.match(r'^[a-zA-Z0-9.-]+$', target):
+                return False
+            
+            # Check for command injection patterns
+            dangerous_chars = [';', '&', '|', '`', '$', '(', ')', '<', '>', '"', "'", '\\']
+            if any(char in target for char in dangerous_chars):
+                return False
+            
             # Try to resolve the hostname/IP
             socket.gethostbyname(target)
             return True
@@ -33,11 +43,23 @@ class NetworkDiagnostics:
             Dictionary containing ping results
         """
         try:
-            # Construct ping command based on platform
+            # Validate target before processing
+            if not self.validate_target(target):
+                return {
+                    'success': False,
+                    'error': "Invalid target: contains unsafe characters or cannot be resolved",
+                    'avg_latency': 0,
+                    'min_latency': 0,
+                    'max_latency': 0,
+                    'packet_loss': 100.0
+                }
+            
+            # Construct ping command based on platform with sanitized target
+            sanitized_target = shlex.quote(target)
             if self.platform == "windows":
-                cmd = ["ping", "-n", str(count), "-w", str(timeout * 1000), target]
+                cmd = ["ping", "-n", str(count), "-w", str(timeout * 1000), sanitized_target]
             else:
-                cmd = ["ping", "-c", str(count), "-W", str(timeout), target]
+                cmd = ["ping", "-c", str(count), "-W", str(timeout), sanitized_target]
             
             # Execute ping command
             result = subprocess.run(
@@ -158,11 +180,20 @@ class NetworkDiagnostics:
             Dictionary containing traceroute results
         """
         try:
-            # Construct traceroute command based on platform
+            # Validate target before processing
+            if not self.validate_target(target):
+                return {
+                    'success': False,
+                    'error': "Invalid target: contains unsafe characters or cannot be resolved",
+                    'hops': []
+                }
+            
+            # Construct traceroute command based on platform with sanitized target
+            sanitized_target = shlex.quote(target)
             if self.platform == "windows":
-                cmd = ["tracert", "-h", str(max_hops), "-w", str(timeout * 1000), target]
+                cmd = ["tracert", "-h", str(max_hops), "-w", str(timeout * 1000), sanitized_target]
             else:
-                cmd = ["traceroute", "-m", str(max_hops), "-w", str(timeout), target]
+                cmd = ["traceroute", "-m", str(max_hops), "-w", str(timeout), sanitized_target]
             
             # Execute traceroute command
             result = subprocess.run(
@@ -212,7 +243,7 @@ class NetworkDiagnostics:
                     continue
                 
                 hop_info = self._parse_hop_line(line)
-                if hop_info:
+                if hop_info and hop_info['hop'] > 0:
                     hops.append(hop_info)
             
             return {
@@ -286,10 +317,20 @@ class NetworkDiagnostics:
                         'hostname': hostname if hostname != ip_addr else None
                     }
             
-            return None
+            return {
+                'hop': 0,
+                'ip': 'Unknown',
+                'latency': 0,
+                'hostname': None
+            }
             
         except Exception:
-            return None
+            return {
+                'hop': 0,
+                'ip': 'Unknown',
+                'latency': 0,
+                'hostname': None
+            }
     
     def single_ping(self, target: str, timeout: int = 5) -> Dict[str, Any]:
         """
