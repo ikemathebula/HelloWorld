@@ -1,344 +1,226 @@
+# app.py
+
 import streamlit as st
+import time
+import socket
+import traceback
+import ipaddress
+from datetime import datetime
+import pandas as pd
 import plotly.graph_objects as go
 import plotly.express as px
-import pandas as pd
-import time
-import threading
-from datetime import datetime, timedelta
-import json
 from network_utils import NetworkDiagnostics
 
-# Initialize session state
-if 'ping_data' not in st.session_state:
-    st.session_state.ping_data = []
-if 'traceroute_data' not in st.session_state:
-    st.session_state.traceroute_data = []
-if 'monitoring_active' not in st.session_state:
-    st.session_state.monitoring_active = False
-if 'target_host' not in st.session_state:
-    st.session_state.target_host = ""
+# ── 1) Page config ─────────────────────────────────────────────────────────────
+st.set_page_config(page_title="Network Diagnostic Tool", page_icon="🌐", layout="wide")
 
-def add_ping_data(host, latency, packet_loss, timestamp):
-    """Add new ping data to session state"""
+# ── 2) Session‐state defaults ─────────────────────────────────────────────────
+for key, default in {
+    "ping_data":         [],
+    "traceroute_data":   [],
+    "monitoring_active": False,
+    "target_host":       "",
+    "error_logs":        [],
+}.items():
+    if key not in st.session_state:
+        st.session_state[key] = default
+
+# ── 3) Helpers ─────────────────────────────────────────────────────────────────
+def log_error(exc: Exception):
+    tb = traceback.format_exc().strip().splitlines()[-1]
+    timestamp = datetime.now().strftime("%H:%M:%S")
+    st.session_state.error_logs.append(f"[{timestamp}] {tb}")
+
+def add_ping_data(latency: float, packet_loss: float):
     st.session_state.ping_data.append({
-        'timestamp': timestamp,
-        'host': host,
-        'latency': latency,
-        'packet_loss': packet_loss
+        "timestamp":   datetime.now(),
+        "host":        st.session_state.target_host,
+        "latency":     latency,
+        "packet_loss": packet_loss,
     })
-    # Keep only last 100 data points for performance
     if len(st.session_state.ping_data) > 100:
         st.session_state.ping_data = st.session_state.ping_data[-100:]
 
-def monitoring_loop(host, interval=2):
-    """Background monitoring loop"""
-    net_diag = NetworkDiagnostics()
-    while st.session_state.monitoring_active:
-        try:
-            result = net_diag.ping(host)
-            if result['success']:
-                add_ping_data(
-                    host, 
-                    result['avg_latency'], 
-                    result['packet_loss'], 
-                    datetime.now()
-                )
-            time.sleep(interval)
-        except Exception as e:
-            st.error(f"Monitoring error: {str(e)}")
-            break
+def do_single_ping():
+    try:
+        diag = NetworkDiagnostics()
+        res  = diag.single_ping(st.session_state.target_host)
+        if res["success"]:
+            add_ping_data(res["latency"], res["packet_loss"])
+        else:
+            add_ping_data(0.0, 100.0)
+            log_error(Exception(res.get("error", "Ping failed")))
+    except Exception as e:
+        log_error(e)
 
+def resolve_dns(host: str) -> str:
+    try:
+        return socket.gethostbyname(host)
+    except Exception as e:
+        log_error(e)
+        return "Resolution failed"
+
+def scan_ports(host: str, ports: list[int]) -> dict[int, bool]:
+    results = {}
+    for port in ports:
+        try:
+            with socket.socket() as s:
+                s.settimeout(0.5)
+                results[port] = (s.connect_ex((host, port)) == 0)
+        except Exception as e:
+            results[port] = False
+            log_error(e)
+    return results
+
+# ── 4) Main App ─────────────────────────────────────────────────────────────────
 def main():
-    st.set_page_config(
-        page_title="Network Diagnostic Tool",
-        page_icon="🌐",
-        layout="wide"
-    )
-    
     st.title("🌐 Network Diagnostic Tool")
-    st.markdown("Monitor network latency, packet loss, and analyze network paths in real-time")
-    
-    # Sidebar for controls
+    st.markdown("Monitor latency, packet loss, DNS, port-scan, network-wide scan, and traceroute in real time.")
+
+    # — Sidebar ──────────────────────────────────────────────────────────────────
     with st.sidebar:
         st.header("Configuration")
-        
-        # Target input
-        target_input = st.text_input(
-            "Target IP Address or URL",
-            value="8.8.8.8",
-            help="Enter an IP address or domain name to monitor"
-        )
-        
-        # Validation
-        if target_input:
-            net_diag = NetworkDiagnostics()
-            if net_diag.validate_target(target_input):
-                st.success("✅ Valid target")
-                st.session_state.target_host = target_input
-            else:
-                st.error("❌ Invalid IP address or URL")
-                st.session_state.target_host = ""
-        
+        host = st.text_input("Target IP/Hostname", value=st.session_state.target_host or "8.8.8.8")
+        if host != st.session_state.target_host:
+            st.session_state.target_host     = host
+            st.session_state.ping_data.clear()
+            st.session_state.traceroute_data.clear()
+            st.session_state.error_logs.clear()
+
+        interval = st.slider("Polling Interval (s)", 1, 10, 2)
+
         st.divider()
-        
-        # Monitoring controls
-        st.header("Monitoring Controls")
-        
-        col1, col2 = st.columns(2)
-        
-        with col1:
-            if st.button("▶️ Start Monitoring", disabled=not st.session_state.target_host):
-                if not st.session_state.monitoring_active:
-                    st.session_state.monitoring_active = True
-                    # Start monitoring in background thread
-                    thread = threading.Thread(
-                        target=monitoring_loop, 
-                        args=(st.session_state.target_host,),
-                        daemon=True
-                    )
-                    thread.start()
-                    st.success("Monitoring started!")
-                    st.rerun()
-        
-        with col2:
-            if st.button("⏹️ Stop Monitoring"):
-                st.session_state.monitoring_active = False
-                st.info("Monitoring stopped!")
-                st.rerun()
-        
-        # Clear data
+        st.header("Controls")
+        if st.button("▶️ Start Monitoring", disabled=not host):
+            st.session_state.monitoring_active = True
+            st.rerun()
+        if st.button("⏹️ Stop Monitoring"):
+            st.session_state.monitoring_active = False
+            st.rerun()
         if st.button("🗑️ Clear Data"):
-            st.session_state.ping_data = []
-            st.session_state.traceroute_data = []
-            st.success("Data cleared!")
-            st.rerun()
-        
-        # Monitoring status
-        if st.session_state.monitoring_active:
-            st.success("🟢 Monitoring Active")
-        else:
-            st.info("🔴 Monitoring Inactive")
-    
-    # Main content area
-    if st.session_state.target_host:
-        
-        # Real-time metrics
-        st.header("📊 Real-time Metrics")
-        
-        if st.session_state.ping_data:
-            latest_data = st.session_state.ping_data[-1]
-            
-            col1, col2, col3, col4 = st.columns(4)
-            
-            with col1:
-                st.metric(
-                    "Current Latency",
-                    f"{latest_data['latency']:.1f} ms" if latest_data['latency'] > 0 else "N/A",
-                    delta=None
-                )
-            
-            with col2:
-                st.metric(
-                    "Packet Loss",
-                    f"{latest_data['packet_loss']:.1f}%",
-                    delta=None
-                )
-            
-            with col3:
-                if len(st.session_state.ping_data) >= 2:
-                    avg_latency = sum(d['latency'] for d in st.session_state.ping_data if d['latency'] > 0) / len([d for d in st.session_state.ping_data if d['latency'] > 0])
-                    st.metric("Average Latency", f"{avg_latency:.1f} ms")
-                else:
-                    st.metric("Average Latency", "N/A")
-            
-            with col4:
-                total_loss = sum(d['packet_loss'] for d in st.session_state.ping_data) / len(st.session_state.ping_data)
-                st.metric("Total Packet Loss", f"{total_loss:.1f}%")
-        
-        # Interactive charts
-        st.header("📈 Network Performance Charts")
-        
-        if st.session_state.ping_data:
-            df = pd.DataFrame(st.session_state.ping_data)
-            
-            # Latency over time chart
-            col1, col2 = st.columns(2)
-            
-            with col1:
-                st.subheader("Latency Over Time")
-                fig_latency = go.Figure()
-                
-                valid_data = df[df['latency'] > 0]
-                if not valid_data.empty:
-                    fig_latency.add_trace(go.Scatter(
-                        x=valid_data['timestamp'],
-                        y=valid_data['latency'],
-                        mode='lines+markers',
-                        name='Latency (ms)',
-                        line=dict(color='#1f77b4', width=2),
-                        marker=dict(size=4)
-                    ))
-                
-                fig_latency.update_layout(
-                    xaxis_title="Time",
-                    yaxis_title="Latency (ms)",
-                    height=400,
-                    showlegend=False
-                )
-                
-                st.plotly_chart(fig_latency, use_container_width=True)
-            
-            with col2:
-                st.subheader("Packet Loss Over Time")
-                fig_loss = go.Figure()
-                
-                fig_loss.add_trace(go.Scatter(
-                    x=df['timestamp'],
-                    y=df['packet_loss'],
-                    mode='lines+markers',
-                    name='Packet Loss (%)',
-                    line=dict(color='#ff7f0e', width=2),
-                    marker=dict(size=4),
-                    fill='tonexty'
-                ))
-                
-                fig_loss.update_layout(
-                    xaxis_title="Time",
-                    yaxis_title="Packet Loss (%)",
-                    height=400,
-                    showlegend=False
-                )
-                
-                st.plotly_chart(fig_loss, use_container_width=True)
-            
-            # Latency distribution histogram
-            st.subheader("Latency Distribution")
-            valid_latencies = [d['latency'] for d in st.session_state.ping_data if d['latency'] > 0]
-            
-            if valid_latencies:
-                fig_hist = px.histogram(
-                    x=valid_latencies,
-                    nbins=20,
-                    title="Latency Distribution",
-                    labels={'x': 'Latency (ms)', 'y': 'Count'}
-                )
-                fig_hist.update_layout(height=400)
-                st.plotly_chart(fig_hist, use_container_width=True)
-        
-        # Network Path Analysis
-        st.header("🛤️ Network Path Analysis")
-        
-        col1, col2 = st.columns([1, 3])
-        
-        with col1:
-            if st.button("🔍 Run Traceroute"):
-                with st.spinner("Running traceroute..."):
-                    net_diag = NetworkDiagnostics()
-                    traceroute_result = net_diag.traceroute(st.session_state.target_host)
-                    
-                    if traceroute_result['success']:
-                        st.session_state.traceroute_data = traceroute_result['hops']
-                        st.success("Traceroute completed!")
+            st.session_state.ping_data.clear()
+            st.session_state.traceroute_data.clear()
+            st.session_state.error_logs.clear()
+
+        st.markdown("**Status:** " + ("🟢 Active" if st.session_state.monitoring_active else "🔴 Inactive"))
+
+        # DNS Lookup
+        if host:
+            st.divider()
+            st.subheader("🔍 DNS Lookup")
+            ip = resolve_dns(host)
+            st.write(f"Resolved IP: `{ip}`")
+
+        # Port Scan (including 10443)
+        if host:
+            st.divider()
+            st.subheader("🔌 Port Scan")
+            default_ports = [22, 80, 443, 8080, 10443]
+            ports = st.multiselect("Select Ports to Scan", default_ports, default=default_ports)
+            if st.button("Start Port Scan"):
+                results = scan_ports(host, ports)
+                df = pd.DataFrame.from_dict(results, orient="index", columns=["Open"])
+                st.dataframe(df.rename_axis("Port"), use_container_width=True)
+
+        # Network-wide Scan
+        st.divider()
+        st.subheader("🌐 Network-wide Scan")
+        net_cidr = st.text_input("Network CIDR", "192.168.1.0/24")
+        if st.button("Scan Entire Network"):
+            diag = NetworkDiagnostics()
+            hosts = list(ipaddress.ip_network(net_cidr, strict=False).hosts())
+            scan_ports_list = [22, 80, 443, 8080, 10443]
+            results = []
+            progress = st.progress(0)
+            for i, ip in enumerate(hosts):
+                ip_str = str(ip)
+                ping_res = diag.single_ping(ip_str)
+                port_res = scan_ports(ip_str, scan_ports_list) if ping_res["success"] else {p: False for p in scan_ports_list}
+                results.append({"host": ip_str,
+                                "reachable": ping_res["success"],
+                                **{f"port_{p}": port_res[p] for p in scan_ports_list}})
+                progress.progress((i + 1) / len(hosts))
+            df_net = pd.DataFrame(results)
+            st.dataframe(df_net, use_container_width=True)
+
+    # — Real-time Metrics ─────────────────────────────────────────────────────────
+    if st.session_state.ping_data:
+        latest = st.session_state.ping_data[-1]
+        c1, c2, c3, c4 = st.columns(4)
+        c1.metric("Latency",     f"{latest['latency']:.1f} ms")
+        c2.metric("Packet Loss", f"{latest['packet_loss']:.1f} %")
+        valid = [d["latency"] for d in st.session_state.ping_data if d["latency"] > 0]
+        c3.metric("Avg Latency", f"{(sum(valid)/len(valid)):.1f} ms" if valid else "N/A")
+        loss_avg = sum(d["packet_loss"] for d in st.session_state.ping_data) / len(st.session_state.ping_data)
+        c4.metric("Total Loss",  f"{loss_avg:.1f} %")
+
+    # — Charts & Raw History ───────────────────────────────────────────────────────
+    if st.session_state.ping_data:
+        df = pd.DataFrame(st.session_state.ping_data)
+        st.subheader("📈 Latency Over Time")
+        valid_df = df[df.latency > 0]
+        fig1 = go.Figure()
+        if not valid_df.empty:
+            fig1.add_trace(go.Scatter(x=valid_df.timestamp, y=valid_df.latency, mode="lines+markers"))
+        fig1.update_layout(xaxis_title="Time", yaxis_title="Latency (ms)", height=300)
+        st.plotly_chart(fig1, use_container_width=True)
+
+        st.subheader("📈 Packet Loss Over Time")
+        fig2 = go.Figure(go.Scatter(x=df.timestamp, y=df.packet_loss, mode="lines+markers", fill="tonexty"))
+        fig2.update_layout(xaxis_title="Time", yaxis_title="Packet Loss (%)", height=300)
+        st.plotly_chart(fig2, use_container_width=True)
+
+        if not valid_df.empty:
+            st.subheader("📊 Latency Distribution")
+            fig3 = px.histogram(valid_df, x="latency", nbins=20, labels={"latency":"Latency (ms)"})
+            fig3.update_layout(height=300)
+            st.plotly_chart(fig3, use_container_width=True)
+
+        with st.expander("View Raw Ping History"):
+            raw = df.copy()
+            raw["Time"] = raw.timestamp.dt.strftime("%H:%M:%S")
+            raw["Latency (ms)"] = raw.latency.apply(lambda x: f"{x:.1f}" if x>0 else "Timeout")
+            raw["Packet Loss (%)"] = raw.packet_loss.apply(lambda x: f"{x:.1f}")
+            st.dataframe(raw[["Time","host","Latency (ms)","Packet Loss (%)"]], hide_index=True)
+
+    # — Traceroute ─────────────────────────────────────────────────────────────────
+    st.header("🛤️ Network Path Analysis")
+    colA, colB = st.columns([1,3])
+    with colA:
+        if st.button("🔍 Run Traceroute"):
+            with st.spinner("Tracing…"):
+                try:
+                    diag = NetworkDiagnostics()
+                    res  = diag.traceroute(st.session_state.target_host)
+                    if res["success"]:
+                        st.session_state.traceroute_data = res["hops"]
                     else:
-                        st.error(f"Traceroute failed: {traceroute_result['error']}")
-                    st.rerun()
-        
-        with col2:
-            if st.session_state.traceroute_data:
-                st.subheader("Network Path Visualization")
-                
-                # Create traceroute visualization
-                hops_df = pd.DataFrame(st.session_state.traceroute_data)
-                
-                if not hops_df.empty:
-                    fig_trace = go.Figure()
-                    
-                    # Add scatter plot for hops
-                    fig_trace.add_trace(go.Scatter(
-                        x=hops_df['hop'],
-                        y=hops_df['latency'],
-                        mode='lines+markers+text',
-                        text=hops_df['ip'],
-                        textposition="top center",
-                        name='Network Hops',
-                        line=dict(color='#2ca02c', width=3),
-                        marker=dict(size=8, color='#2ca02c')
-                    ))
-                    
-                    fig_trace.update_layout(
-                        title="Network Path Latency by Hop",
-                        xaxis_title="Hop Number",
-                        yaxis_title="Latency (ms)",
-                        height=400,
-                        showlegend=False
-                    )
-                    
-                    st.plotly_chart(fig_trace, use_container_width=True)
-        
-        # Traceroute details table
+                        log_error(Exception(res.get("error","Traceroute failed")))
+                except Exception as e:
+                    log_error(e)
+                st.rerun()
+    with colB:
         if st.session_state.traceroute_data:
-            st.subheader("Traceroute Details")
-            
-            trace_df = pd.DataFrame(st.session_state.traceroute_data)
-            trace_df['Status'] = trace_df['latency'].apply(
-                lambda x: "✅ Responsive" if x > 0 else "❌ Timeout"
-            )
-            trace_df['Latency (ms)'] = trace_df['latency'].apply(
-                lambda x: f"{x:.1f}" if x > 0 else "Timeout"
-            )
-            
-            st.dataframe(
-                trace_df[['hop', 'ip', 'Latency (ms)', 'Status']].rename(columns={
-                    'hop': 'Hop #',
-                    'ip': 'IP Address'
-                }),
-                use_container_width=True,
-                hide_index=True
-            )
-        
-        # Historical data table
-        if st.session_state.ping_data:
-            st.header("📋 Historical Data")
-            
-            with st.expander("View Raw Data"):
-                hist_df = pd.DataFrame(st.session_state.ping_data)
-                hist_df['Timestamp'] = hist_df['timestamp'].dt.strftime('%H:%M:%S')
-                hist_df['Latency (ms)'] = hist_df['latency'].apply(
-                    lambda x: f"{x:.1f}" if x > 0 else "Timeout"
-                )
-                hist_df['Packet Loss (%)'] = hist_df['packet_loss'].apply(lambda x: f"{x:.1f}")
-                
-                st.dataframe(
-                    hist_df[['Timestamp', 'host', 'Latency (ms)', 'Packet Loss (%)']].rename(columns={
-                        'host': 'Target Host'
-                    }),
-                    use_container_width=True,
-                    hide_index=True
-                )
-        
-        # Auto-refresh for real-time updates
-        if st.session_state.monitoring_active:
-            time.sleep(2)
-            st.rerun()
-    
-    else:
-        st.info("👆 Please enter a valid IP address or URL in the sidebar to begin network diagnostics.")
-        
-        # Show example usage
-        st.header("ℹ️ How to Use")
-        st.markdown("""
-        1. **Enter Target**: Input an IP address or domain name in the sidebar
-        2. **Start Monitoring**: Click the start button to begin real-time monitoring
-        3. **View Metrics**: Watch live latency and packet loss data
-        4. **Analyze Path**: Use traceroute to see network path and identify bottlenecks
-        5. **Historical Analysis**: Review trends and patterns in network performance
-        
-        **Example targets to try:**
-        - `8.8.8.8` (Google DNS)
-        - `1.1.1.1` (Cloudflare DNS)
-        - `google.com`
-        - `github.com`
-        """)
+            hops = pd.DataFrame(st.session_state.traceroute_data)
+            fig  = go.Figure(go.Scatter(x=hops.hop, y=hops.latency, mode="lines+markers+text",
+                                        text=hops.ip, textposition="top center"))
+            fig.update_layout(xaxis_title="Hop", yaxis_title="Latency (ms)", height=300)
+            st.plotly_chart(fig, use_container_width=True)
+            hops["Status"] = hops.latency.apply(lambda x: "✅" if x>0 else "❌")
+            hops["Latency (ms)"] = hops.latency.apply(lambda x: f"{x:.1f}" if x>0 else "Timeout")
+            st.dataframe(hops[["hop","ip","Latency (ms)","Status"]], hide_index=True)
+
+    # — Error Logs ─────────────────────────────────────────────────────────────────
+    if st.session_state.error_logs:
+        with st.expander("⚠️ Error Logs"):
+            for line in st.session_state.error_logs:
+                st.write(line)
+
+    # ── 5) Ping Loop ───────────────────────────────────────────────────────────────
+    if st.session_state.monitoring_active and st.session_state.target_host:
+        do_single_ping()
+        time.sleep(interval)
+        st.rerun()
 
 if __name__ == "__main__":
     main()
